@@ -36,7 +36,7 @@ DEBATE_ROLE_ID = int(os.getenv("DEBATE_ROLE_ID", "0"))
 DEBATE_LOCK_ROLE_ID = int(os.getenv("DEBATE_LOCK_ROLE_ID", "0"))
 
 KARMA_START = int(os.getenv("KARMA_START", "100"))
-KARMA_WARN = int(os.getenv("KARMA_WARN", "-25"))
+KARMA_WARN = int(os.getenv("KARMA_WARN", "-25"))   # legacy default; new warn uses mapped deltas
 KARMA_PRAISE = int(os.getenv("KARMA_PRAISE", "5"))
 KARMA_KUDOS = int(os.getenv("KARMA_KUDOS", "1"))
 
@@ -48,6 +48,33 @@ KARMA_AUTO_RESTORE_DEBATE = os.getenv("KARMA_AUTO_RESTORE_DEBATE", "false").stri
 # Optional profanity scanning (simple example)
 ENABLE_PROFANITY_SCAN = os.getenv("ENABLE_PROFANITY_SCAN", "false").strip().lower() == "true"
 PROFANITY_WORDS = [w.strip().lower() for w in os.getenv("PROFANITY_WORDS", "").split(",") if w.strip()]
+
+# --- Warn rule catalog (specific, ordered by severity) ---
+# value key, label shown in Discord, delta (negative = lose ELO)
+WARN_VIOLATIONS = [
+    # Minor (-5)
+    ("A1_WRONG_CHANNEL", "A1 Wrong channel / off-topic (-5)", -5),
+    ("A2_SPAM_LIGHT", "A2 Light spam / clutter (-5)", -5),
+    ("A3_BAD_FAITH_LIGHT", "A3 Bad faith (light) (-5)", -5),
+
+    # Medium (-10)
+    ("B1_TOXIC_TACTICS", "B1 Toxic debate tactics (-10)", -10),
+    ("B2_SOURCES_REPEAT", "B2 Repeated refusal to source (-10)", -10),
+    ("B3_MOD_CONDUCT", "B3 Disrespecting mod calls publicly (-10)", -10),
+
+    # High (-15)
+    ("C1_INSULTS", "C1 Insults / ad hominem / harassment (-15)", -15),
+
+    # Severe (-20 / -25)
+    ("D1_SENSITIVE", "D1 Sensitive content (nudity/gore/violence) (-20)", -20),
+    ("D2_HATE_SPEECH", "D2 Hate speech / racism / slurs (-25)", -25),
+
+    # Perm-ban tier
+    ("E1_DOXX", "E1 Doxxing / personal info (PERM BAN tier)", 0),
+]
+
+WARN_LABEL_BY_KEY = {k: label for (k, label, d) in WARN_VIOLATIONS}
+WARN_DELTA_BY_KEY = {k: d for (k, label, d) in WARN_VIOLATIONS}
 
 # ---- Intents ----
 intents = discord.Intents.default()
@@ -542,9 +569,21 @@ def _register_karma_commands_once():
         except Exception as e:
             await interaction.response.send_message(f"Sync failed: {repr(e)}", ephemeral=True)
 
-    @app_commands.command(name="warn", description="Warn a user (default -25) and log a case.")
-    @app_commands.describe(user="User to warn", reason="Reason for the warning")
-    async def warn_cmd(interaction: discord.Interaction, user: discord.Member, reason: str):
+    @app_commands.command(name="warn", description="Warn a user using the rules dropdown and log a case.")
+    @app_commands.describe(
+        user="User to warn",
+        violation="Pick the rule item",
+        description="Describe what rule was broken (be specific)"
+    )
+    @app_commands.choices(
+        violation=[app_commands.Choice(name=label, value=key) for (key, label, _d) in WARN_VIOLATIONS]
+    )
+    async def warn_cmd(
+        interaction: discord.Interaction,
+        user: discord.Member,
+        violation: app_commands.Choice[str],
+        description: str
+    ):
         if interaction.guild is None:
             return await interaction.response.send_message("Use this in a server.", ephemeral=True)
         if not _is_mod(interaction.user):
@@ -552,11 +591,40 @@ def _register_karma_commands_once():
         if user.bot:
             return await interaction.response.send_message("Not for bots.", ephemeral=True)
 
+        key = violation.value
+        label = WARN_LABEL_BY_KEY.get(key, "Rule violation")
+
+        # Perm-ban tier: doxxing/privacy & safety
+        if key == "E1_DOXX":
+            reason = f"[{label}] {description}"
+            case_id = _insert_case(interaction.guild.id, user.id, interaction.user.id, "WARN_PERMBAN", 0, reason)
+
+            embed = discord.Embed(
+                title=f"Case #{case_id} | WARN (PERM BAN TIER)",
+                color=discord.Color.dark_red(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            embed.add_field(name="User", value=f"{user.mention} (`{user.id}`)", inline=False)
+            embed.add_field(name="Moderator", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+            embed.add_field(name="Violation", value=label, inline=False)
+            embed.add_field(name="Description", value=description, inline=False)
+
+            await _send_modlog(interaction.guild, embed)
+
+            # Intentionally NOT auto-banning in code (you can choose ban/kick manually)
+            return await interaction.response.send_message(
+                f"Logged perm-ban tier case for {user.mention}. Case #{case_id}. (No auto-ban performed.)",
+                ephemeral=True
+            )
+
+        delta = int(WARN_DELTA_BY_KEY.get(key, KARMA_WARN))  # negative
+        reason = f"[{label}] {description}"
+
         current = _get_or_create_karma(interaction.guild.id, user.id)
-        new_val = current + KARMA_WARN
+        new_val = current + delta
         _set_karma(interaction.guild.id, user.id, new_val)
 
-        case_id = _insert_case(interaction.guild.id, user.id, interaction.user.id, "WARN", KARMA_WARN, reason)
+        case_id = _insert_case(interaction.guild.id, user.id, interaction.user.id, "WARN", delta, reason)
         await _enforce_debate_access(user, new_val)
 
         embed = discord.Embed(
@@ -566,9 +634,10 @@ def _register_karma_commands_once():
         )
         embed.add_field(name="User", value=f"{user.mention} (`{user.id}`)", inline=False)
         embed.add_field(name="Moderator", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
-        embed.add_field(name="Delta", value=str(KARMA_WARN), inline=True)
+        embed.add_field(name="Violation", value=label, inline=False)
+        embed.add_field(name="Delta", value=str(delta), inline=True)
         embed.add_field(name="New karma", value=str(new_val), inline=True)
-        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Description", value=description, inline=False)
 
         await _send_modlog(interaction.guild, embed)
 
@@ -576,18 +645,17 @@ def _register_karma_commands_once():
         try:
             dm = discord.Embed(title="You received a warning", color=discord.Color.red())
             dm.add_field(name="Server", value=interaction.guild.name, inline=False)
-            dm.add_field(name="Reason", value=reason, inline=False)
-            dm.add_field(name="Karma change", value=str(KARMA_WARN), inline=True)
+            dm.add_field(name="Violation", value=label, inline=False)
+            dm.add_field(name="Description", value=description, inline=False)
+            dm.add_field(name="Karma change", value=str(delta), inline=True)
             dm.add_field(name="New karma", value=str(new_val), inline=True)
             dm.set_footer(text=f"Case #{case_id}")
             await user.send(embed=dm)
-        except discord.Forbidden:
-            pass
         except Exception:
             pass
 
         await interaction.response.send_message(
-            f"OK. Warned {user.mention}. Case #{case_id}. New karma: {new_val}.",
+            f"OK. Warned {user.mention}. ({label}) Case #{case_id}. New karma: {new_val}.",
             ephemeral=True
         )
 
