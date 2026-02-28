@@ -49,6 +49,14 @@ KARMA_AUTO_RESTORE_DEBATE = os.getenv("KARMA_AUTO_RESTORE_DEBATE", "false").stri
 ENABLE_PROFANITY_SCAN = os.getenv("ENABLE_PROFANITY_SCAN", "false").strip().lower() == "true"
 PROFANITY_WORDS = [w.strip().lower() for w in os.getenv("PROFANITY_WORDS", "").split(",") if w.strip()]
 
+# --- Warn escalation (optional; OFF by default) ---
+ENABLE_WARN_ESCALATION = os.getenv("ENABLE_WARN_ESCALATION", "false").strip().lower() == "true"
+WARN_TIMEOUT_1_COUNT = int(os.getenv("WARN_TIMEOUT_1_COUNT", "3"))
+WARN_TIMEOUT_1_MINUTES = int(os.getenv("WARN_TIMEOUT_1_MINUTES", "30"))
+WARN_TIMEOUT_2_COUNT = int(os.getenv("WARN_TIMEOUT_2_COUNT", "5"))
+WARN_TIMEOUT_2_MINUTES = int(os.getenv("WARN_TIMEOUT_2_MINUTES", "1440"))
+WARN_BAN_COUNT = int(os.getenv("WARN_BAN_COUNT", "7"))
+
 # --- Warn rule catalog (specific, ordered by severity) ---
 # value key, label shown in Discord, delta (negative = lose ELO)
 WARN_VIOLATIONS = [
@@ -383,6 +391,87 @@ def _fetch_case(guild_id: int, case_id: int):
     return row
 
 
+# ? NEW: warning counter (counts WARN and WARN_PERMBAN)
+def _count_warns(guild_id: int, user_id: int) -> int:
+    _ensure_karma_db()
+    conn = sqlite3.connect(_karma_db_path())
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM karma_cases
+        WHERE guild_id=? AND user_id=? AND action IN ('WARN', 'WARN_PERMBAN')
+    """, (guild_id, user_id))
+    n = cur.fetchone()[0] or 0
+    conn.close()
+    return int(n)
+
+
+# ? NEW: optional escalation (timeouts / ban) based on warning #
+async def _maybe_escalate_warn(
+    member: discord.Member,
+    warn_num: int,
+    case_id: int,
+    reason: str,
+    moderator: discord.Member
+):
+    if not ENABLE_WARN_ESCALATION:
+        return
+
+    guild = member.guild
+
+    async def log_escalation(action_text: str):
+        embed = discord.Embed(
+            title=f"Auto Escalation | Warn #{warn_num}",
+            color=discord.Color.orange(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.add_field(name="User", value=f"{member.mention} (`{member.id}`)", inline=False)
+        embed.add_field(name="Triggered by", value=f"{moderator.mention} (`{moderator.id}`)", inline=False)
+        embed.add_field(name="Case", value=f"#{case_id}", inline=True)
+        embed.add_field(name="Action", value=action_text, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await _send_modlog(guild, embed)
+
+    # Ban threshold (>=)
+    if WARN_BAN_COUNT > 0 and warn_num >= WARN_BAN_COUNT:
+        try:
+            await guild.ban(
+                member,
+                reason=f"Auto-ban at warn #{warn_num}. Case #{case_id}. {reason}",
+                delete_message_days=0
+            )
+            await log_escalation(f"BANNED (threshold {WARN_BAN_COUNT})")
+        except discord.Forbidden:
+            await log_escalation("Tried to BAN, but missing permissions / role hierarchy blocked it.")
+        except Exception:
+            await log_escalation("Tried to BAN, but an error occurred.")
+        return
+
+    # Timeout 2 (==)
+    if WARN_TIMEOUT_2_COUNT > 0 and warn_num == WARN_TIMEOUT_2_COUNT and WARN_TIMEOUT_2_MINUTES > 0:
+        try:
+            until = datetime.datetime.utcnow() + datetime.timedelta(minutes=WARN_TIMEOUT_2_MINUTES)
+            await member.timeout(until, reason=f"Auto-timeout at warn #{warn_num}. Case #{case_id}. {reason}")
+            await log_escalation(f"TIMEOUT {WARN_TIMEOUT_2_MINUTES} min (threshold {WARN_TIMEOUT_2_COUNT})")
+        except discord.Forbidden:
+            await log_escalation("Tried to TIMEOUT (level 2), but missing permissions / hierarchy blocked it.")
+        except Exception:
+            await log_escalation("Tried to TIMEOUT (level 2), but an error occurred.")
+        return
+
+    # Timeout 1 (==)
+    if WARN_TIMEOUT_1_COUNT > 0 and warn_num == WARN_TIMEOUT_1_COUNT and WARN_TIMEOUT_1_MINUTES > 0:
+        try:
+            until = datetime.datetime.utcnow() + datetime.timedelta(minutes=WARN_TIMEOUT_1_MINUTES)
+            await member.timeout(until, reason=f"Auto-timeout at warn #{warn_num}. Case #{case_id}. {reason}")
+            await log_escalation(f"TIMEOUT {WARN_TIMEOUT_1_MINUTES} min (threshold {WARN_TIMEOUT_1_COUNT})")
+        except discord.Forbidden:
+            await log_escalation("Tried to TIMEOUT (level 1), but missing permissions / hierarchy blocked it.")
+        except Exception:
+            await log_escalation("Tried to TIMEOUT (level 1), but an error occurred.")
+        return
+
+
 def _is_mod(member: discord.Member) -> bool:
     p = member.guild_permissions
     return any([
@@ -594,18 +683,20 @@ def _register_karma_commands_once():
         key = violation.value
         label = WARN_LABEL_BY_KEY.get(key, "Rule violation")
 
-        # Perm-ban tier: doxxing/privacy & safety
+        # Perm-ban tier: doxxing/privacy & safety (logged only; still manual ban)
         if key == "E1_DOXX":
             reason = f"[{label}] {description}"
             case_id = _insert_case(interaction.guild.id, user.id, interaction.user.id, "WARN_PERMBAN", 0, reason)
+            warn_num = _count_warns(interaction.guild.id, user.id)
 
             embed = discord.Embed(
-                title=f"Case #{case_id} | WARN (PERM BAN TIER)",
+                title=f"Case #{case_id} | WARN #{warn_num} (PERM BAN TIER)",
                 color=discord.Color.dark_red(),
                 timestamp=datetime.datetime.utcnow()
             )
             embed.add_field(name="User", value=f"{user.mention} (`{user.id}`)", inline=False)
             embed.add_field(name="Moderator", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+            embed.add_field(name="Warning #", value=str(warn_num), inline=True)
             embed.add_field(name="Violation", value=label, inline=False)
             embed.add_field(name="Description", value=description, inline=False)
 
@@ -613,7 +704,7 @@ def _register_karma_commands_once():
 
             # Intentionally NOT auto-banning in code (you can choose ban/kick manually)
             return await interaction.response.send_message(
-                f"Logged perm-ban tier case for {user.mention}. Case #{case_id}. (No auto-ban performed.)",
+                f"Logged perm-ban tier case for {user.mention}. Warning #{warn_num}. Case #{case_id}. (No auto-ban performed.)",
                 ephemeral=True
             )
 
@@ -625,15 +716,18 @@ def _register_karma_commands_once():
         _set_karma(interaction.guild.id, user.id, new_val)
 
         case_id = _insert_case(interaction.guild.id, user.id, interaction.user.id, "WARN", delta, reason)
+        warn_num = _count_warns(interaction.guild.id, user.id)
+
         await _enforce_debate_access(user, new_val)
 
         embed = discord.Embed(
-            title=f"Case #{case_id} | WARN",
+            title=f"Case #{case_id} | WARN #{warn_num}",
             color=discord.Color.red(),
             timestamp=datetime.datetime.utcnow()
         )
         embed.add_field(name="User", value=f"{user.mention} (`{user.id}`)", inline=False)
         embed.add_field(name="Moderator", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+        embed.add_field(name="Warning #", value=str(warn_num), inline=True)
         embed.add_field(name="Violation", value=label, inline=False)
         embed.add_field(name="Delta", value=str(delta), inline=True)
         embed.add_field(name="New karma", value=str(new_val), inline=True)
@@ -643,8 +737,9 @@ def _register_karma_commands_once():
 
         # DM the user (best-effort)
         try:
-            dm = discord.Embed(title="You received a warning", color=discord.Color.red())
+            dm = discord.Embed(title=f"You received Warning #{warn_num}", color=discord.Color.red())
             dm.add_field(name="Server", value=interaction.guild.name, inline=False)
+            dm.add_field(name="Warning #", value=str(warn_num), inline=True)
             dm.add_field(name="Violation", value=label, inline=False)
             dm.add_field(name="Description", value=description, inline=False)
             dm.add_field(name="Karma change", value=str(delta), inline=True)
@@ -654,8 +749,14 @@ def _register_karma_commands_once():
         except Exception:
             pass
 
+        # Optional escalation (OFF by default)
+        try:
+            await _maybe_escalate_warn(user, warn_num, case_id, reason, interaction.user)
+        except Exception:
+            pass
+
         await interaction.response.send_message(
-            f"OK. Warned {user.mention}. ({label}) Case #{case_id}. New karma: {new_val}.",
+            f"OK. Warned {user.mention}. ({label}) Warning #{warn_num}. Case #{case_id}. New karma: {new_val}.",
             ephemeral=True
         )
 
